@@ -1,7 +1,6 @@
 package krb5test
 
 import (
-	"context"
 	"encoding/asn1"
 	"errors"
 	"fmt"
@@ -43,8 +42,10 @@ type KDC struct {
 	UDPListener net.PacketConn
 	// wg counts the number of outstanding requests on this server.
 	// Close blocks until all requests are finished.
-	wg      sync.WaitGroup
-	errChan chan error
+
+	errChan  chan error
+	udpWg    sync.WaitGroup
+	udpClose chan interface{}
 }
 
 type PrincipalDetails struct {
@@ -58,6 +59,14 @@ func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 	kdc.Realm = strings.ToUpper(srealm)
 	kdc.Logger = l
 	kdc.errChan = make(chan error, 1)
+	kdc.udpClose = make(chan interface{})
+
+	go func() {
+		for err := range kdc.errChan {
+			kdc.Logger.Printf("ERROR: %v", err)
+		}
+	}()
+
 	kdc.SName = types.PrincipalName{
 		NameType:   nametype.KRB_NT_SRV_INST,
 		NameString: []string{"krbtgt", kdc.Realm},
@@ -126,25 +135,17 @@ func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 	return kdc, nil
 }
 
-const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-func randomString(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letterBytes[rand.Intn(len(letterBytes))]
-	}
-	return string(b)
-}
-
 func (k *KDC) Start() {
-	k.goServeUDP(context.Background())
+	k.goServeUDP()
 }
 
 func (k *KDC) Close() {
+	close(k.udpClose)
 	err := k.UDPListener.Close()
 	if err != nil {
 		k.Logger.Printf("error when closing UDP listenner: %v", err)
 	}
+	k.udpWg.Wait()
 	err = k.TCPListener.Close()
 	if err != nil {
 		k.Logger.Printf("error when closing TCP listenner: %v", err)
@@ -152,47 +153,49 @@ func (k *KDC) Close() {
 	close(k.errChan)
 }
 
-func (k *KDC) goServeUDP(ctx context.Context) {
+func (k *KDC) goServeUDP() {
 	go func() {
 		for {
 			udpbuf := make([]byte, 4096)
 			n, addr, err := k.UDPListener.ReadFrom(udpbuf)
 			if err != nil {
-				k.errChan <- err
-				return
-			}
-			k.Logger.Printf("UDP packet received: bytes=%d from=%s", n, addr.String())
-			deadline := time.Now().Add(time.Second * 10)
-			err = k.UDPListener.SetWriteDeadline(deadline)
-			if err != nil {
-				k.errChan <- err
-				return
-			}
-			ib := make([]byte, n, n)
-			copy(ib, udpbuf)
+				select {
+				case <-k.udpClose:
+					// ReadFrom has errored as we are closing down
+					return
+				default:
+					k.errChan <- fmt.Errorf("error reading from UDP listener: %v", err)
+				}
+			} else {
+				k.Logger.Printf("UDP packet received: bytes=%d from=%s", n, addr.String())
+				k.udpWg.Add(1) // we have a message to handle so iterate wg
+				go func() {
+					deadline := time.Now().Add(time.Second * 10)
+					err = k.UDPListener.SetWriteDeadline(deadline)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", addr, err)
+						return
+					}
+					ib := make([]byte, n, n)
+					copy(ib, udpbuf)
 
-			ob, err := k.getResponseBytes(ib, addr)
-			if err != nil {
-				k.errChan <- err
-			}
+					ob, err := k.getResponseBytes(ib, addr)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", addr, err)
+						return
+					}
 
-			n, err = k.UDPListener.WriteTo(ob, addr)
-			if err != nil {
-				k.errChan <- err
-				return
+					n, err = k.UDPListener.WriteTo(ob, addr)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", addr, err)
+						return
+					}
+					k.Logger.Printf("UDP packet sent: bytes=%d to=%s", n, addr.String())
+					k.udpWg.Done()
+				}()
 			}
-			k.Logger.Printf("UDP packet sent: bytes=%d to=%s", n, addr.String())
-			k.errChan <- nil
 		}
 	}()
-	select {
-	case <-ctx.Done():
-		err := ctx.Err()
-		k.Logger.Print(err.Error())
-	case err := <-k.errChan:
-		k.Logger.Print(err.Error())
-	}
-	return
 }
 
 //msgType returns the kerberos message type ID for the bytes received
@@ -216,15 +219,13 @@ func (kdc *KDC) getResponseBytes(b []byte, cAddr net.Addr) ([]byte, error) {
 	}
 	switch mt {
 	case msgtype.KRB_AS_REQ:
-		kdc.Logger.Printf("received AS_REQ: from=%v", cAddr)
 		m := new(messages.ASReq)
 		err := m.Unmarshal(b)
 		if err != nil {
 			return kdc.krbError(errorcode.KRB_ERR_GENERIC, err)
 		}
-		return kdc.asRep(m)
+		return kdc.asRep(m, cAddr)
 	case msgtype.KRB_TGS_REQ:
-		kdc.Logger.Printf("received TGS_REQ: from=%v", cAddr)
 		m := new(messages.TGSReq)
 		err := m.Unmarshal(b)
 		if err != nil {
@@ -243,11 +244,13 @@ func (kdc *KDC) krbError(errorCode int32, err error) ([]byte, error) {
 	return b, m
 }
 
-func (kdc *KDC) asRep(req *messages.ASReq) ([]byte, error) {
+func (kdc *KDC) asRep(req *messages.ASReq, cAddr net.Addr) ([]byte, error) {
+	kdc.Logger.Printf("AS_REQ from=%s: %+v", cAddr, *req)
 	etype := kdc.selectTktEtype(req)
 	if etype == 0 {
 		return kdc.krbError(errorcode.KDC_ERR_ETYPE_NOSUPP, errors.New("cannot agree on enctype to use"))
 	}
+	kdc.Logger.Printf("AS_REQ from=%s: selected enctype %d", cAddr, etype)
 
 	t := time.Now().UTC()
 	endTime := t.Add(kdc.KRB5Conf.LibDefaults.TicketLifetime)
@@ -298,6 +301,7 @@ func (kdc *KDC) asRep(req *messages.ASReq) ([]byte, error) {
 			EncPart: encData,
 		},
 	}
+	kdc.Logger.Printf("AS_REQ from=%s: AS_REP generated %+v", cAddr, m)
 	mb, err := m.Marshal()
 	if err != nil {
 		return kdc.krbError(errorcode.KRB_ERR_GENERIC, fmt.Errorf("error marshaling AS_REP: %v", err))
@@ -306,6 +310,7 @@ func (kdc *KDC) asRep(req *messages.ASReq) ([]byte, error) {
 }
 
 func (kdc *KDC) tgsRep(req *messages.TGSReq, cAddr net.Addr) ([]byte, error) {
+	kdc.Logger.Printf("AS_REQ from=%s: %+v", cAddr, *req)
 	// Get the AP_REQ from the PA data
 	var apReq messages.APReq
 	for _, pa := range req.PAData {
@@ -343,6 +348,7 @@ func (kdc *KDC) tgsRep(req *messages.TGSReq, cAddr net.Addr) ([]byte, error) {
 	if etype == 0 {
 		return kdc.krbError(errorcode.KDC_ERR_ETYPE_NOSUPP, errors.New("cannot agree on enctype to use"))
 	}
+	kdc.Logger.Printf("TGS_REQ from=%s: selected enctype %d", cAddr, etype)
 
 	// Check authenticator checksum
 	b, err := req.ReqBody.Marshal()
@@ -410,6 +416,7 @@ func (kdc *KDC) tgsRep(req *messages.TGSReq, cAddr net.Addr) ([]byte, error) {
 			EncPart: encData,
 		},
 	}
+	kdc.Logger.Printf("TGS_REQ from=%s: TGS_REP generated %+v", cAddr, m)
 	mb, err := m.Marshal()
 	if err != nil {
 		return kdc.krbError(errorcode.KRB_ERR_GENERIC, fmt.Errorf("error marshaling AS_REP: %v", err))
@@ -437,4 +444,14 @@ func (kdc *KDC) selectTGSEtype(req *messages.TGSReq) int32 {
 		}
 	}
 	return 0
+}
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func randomString(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+	}
+	return string(b)
 }

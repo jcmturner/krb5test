@@ -20,11 +20,18 @@ func TestNewKDC(t *testing.T) {
 		t.Fatalf("could not create test KDC: %v", err)
 	}
 	kdc.Start()
+	defer kdc.Close()
 
 	errChan := make(chan error, 1)
+	go func() {
+		for err := range errChan {
+			t.Error(err)
+		}
+	}()
+
 	var wg sync.WaitGroup
-	wg.Add(10)
 	for i := 0; i < 10; i++ {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			cl := client.NewWithKeytab("testuser1", kdc.Realm, kdc.Keytab, kdc.KRB5Conf)
@@ -38,14 +45,6 @@ func TestNewKDC(t *testing.T) {
 			}
 		}()
 	}
-
-	go func() {
-		wg.Wait()
-		close(errChan)
-		kdc.Close()
-	}()
-
-	for err := range errChan {
-		t.Error(err)
-	}
+	wg.Wait()
+	close(errChan)
 }
