@@ -2,8 +2,10 @@ package krb5test
 
 import (
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -32,20 +34,20 @@ const (
 )
 
 type KDC struct {
-	Realm       string
-	KRB5Conf    *config.Config
-	SName       types.PrincipalName
-	Principals  map[string]PrincipalDetails
-	Keytab      *keytab.Keytab
-	Logger      *log.Logger
+	Realm      string
+	KRB5Conf   *config.Config
+	SName      types.PrincipalName
+	Principals map[string]PrincipalDetails
+	Keytab     *keytab.Keytab
+	Logger     *log.Logger
+
 	TCPListener net.Listener
 	UDPListener net.PacketConn
-	// wg counts the number of outstanding requests on this server.
-	// Close blocks until all requests are finished.
-
-	errChan  chan error
-	udpWg    sync.WaitGroup
-	udpClose chan interface{}
+	errChan     chan error
+	udpWg       sync.WaitGroup
+	udpClose    chan interface{}
+	tcpWg       sync.WaitGroup
+	tcpClose    chan interface{}
 }
 
 type PrincipalDetails struct {
@@ -60,6 +62,7 @@ func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 	kdc.Logger = l
 	kdc.errChan = make(chan error, 1)
 	kdc.udpClose = make(chan interface{})
+	kdc.tcpClose = make(chan interface{})
 
 	go func() {
 		for err := range kdc.errChan {
@@ -137,20 +140,95 @@ func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 
 func (k *KDC) Start() {
 	k.goServeUDP()
+	k.goServeTCP()
 }
 
 func (k *KDC) Close() {
 	close(k.udpClose)
 	err := k.UDPListener.Close()
 	if err != nil {
-		k.Logger.Printf("error when closing UDP listenner: %v", err)
+		k.Logger.Printf("error when closing UDP listener: %v", err)
 	}
 	k.udpWg.Wait()
+	close(k.tcpClose)
 	err = k.TCPListener.Close()
 	if err != nil {
-		k.Logger.Printf("error when closing TCP listenner: %v", err)
+		k.Logger.Printf("error when closing TCP listener: %v", err)
 	}
+	k.tcpWg.Wait()
 	close(k.errChan)
+}
+
+func (k *KDC) goServeTCP() {
+	go func() {
+		for {
+			conn, err := k.TCPListener.Accept()
+			if err != nil {
+				select {
+				case <-k.tcpClose:
+					// Accept has errored as we are closing down
+					return
+				default:
+					k.errChan <- fmt.Errorf("error reading from TCP listener: %v", err)
+				}
+			} else {
+				k.Logger.Printf("TCP connection established: from=%s", conn.RemoteAddr().String())
+				k.tcpWg.Add(1)
+				go func() {
+					defer conn.Close()
+					defer k.tcpWg.Done()
+					deadline := time.Now().Add(time.Second * 10)
+					err := conn.SetDeadline(deadline)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", conn.RemoteAddr().String(), err)
+						return
+					}
+
+					// RFC 4120 7.2.2 specifies the first 4 bytes indicate the length of the message in big endian order.
+					sh := make([]byte, 4, 4)
+					_, err = conn.Read(sh)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", conn.RemoteAddr().String(), err)
+						return
+					}
+					s := binary.BigEndian.Uint32(sh)
+
+					ib := make([]byte, s, s)
+					n, err := io.ReadFull(conn, ib)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", conn.RemoteAddr().String(), err)
+						return
+					}
+					if n != int(s) {
+						k.errChan <- fmt.Errorf("serving=%s: size of data recieved=%d; expected=%d", conn.RemoteAddr(), n, s)
+						return
+					}
+
+					ob, err := k.getResponseBytes(ib, conn.RemoteAddr())
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", conn.RemoteAddr().String(), err)
+						return
+					}
+
+					// Add the size header
+					rb := make([]byte, 4, 4)
+					binary.BigEndian.PutUint32(rb, uint32(len(ob)))
+					rb = append(rb, ob...)
+
+					n, err = conn.Write(rb)
+					if err != nil {
+						k.errChan <- fmt.Errorf("serving=%s: %v", conn.RemoteAddr().String(), err)
+						return
+					}
+					if n != len(rb) {
+						k.errChan <- fmt.Errorf("serving=%s: bytes sent did not match length of reply", conn.RemoteAddr())
+						return
+					}
+					k.Logger.Printf("TCP reply sent: bytes=%d to=%s", n, conn.RemoteAddr().String())
+				}()
+			}
+		}
+	}()
 }
 
 func (k *KDC) goServeUDP() {
@@ -170,6 +248,7 @@ func (k *KDC) goServeUDP() {
 				k.Logger.Printf("UDP packet received: bytes=%d from=%s", n, addr.String())
 				k.udpWg.Add(1) // we have a message to handle so iterate wg
 				go func() {
+					defer k.udpWg.Done()
 					deadline := time.Now().Add(time.Second * 10)
 					err = k.UDPListener.SetWriteDeadline(deadline)
 					if err != nil {
@@ -191,7 +270,6 @@ func (k *KDC) goServeUDP() {
 						return
 					}
 					k.Logger.Printf("UDP packet sent: bytes=%d to=%s", n, addr.String())
-					k.udpWg.Done()
 				}()
 			}
 		}
