@@ -4,7 +4,7 @@ This project provides a mock Kerberos Domain Controller (KDC) suitable for testi
 
 The mock KDC does not provide all KDC funcationality but it does cover the basics of:
 * Responding to the initial login to obtain a TGT via an AS exchange
-* Grant a service ticket in response to a TGS exchange
+* Granting a service ticket in response to a TGS exchange
 
 ## Usage
 1. Create a logger that the KDC will log to:
@@ -39,7 +39,7 @@ A krb5.conf that can be used for a client can also be obtained from the KDC inst
 kdc.KRB5Conf
 ```
 The KDC instance will dynamically pick available ports to use on localhost.
-Use of this krb5.conf will automatically wire up any client to use these connection.
+Use of this krb5.conf will automatically wire up any client to use this connection.
 
 The Realm name used is also available from the KDC instance:
 ```go
