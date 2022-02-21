@@ -28,9 +28,11 @@ import (
 	"github.com/jcmturner/gokrb5/v8/types"
 )
 
-const (
-	encType = "aes256-cts-hmac-sha1-96"
-	srealm  = "TEST.REALM.COM"
+var (
+	ServerEncType = "aes256-cts-hmac-sha1-96" // encrypt type supported in KDC
+	ServerAddr    = "127.0.0.1:0"             // server address of KDC
+	ServerRealm   = "TEST.REALM.COM"          // Realm of KDC
+	ServerDomain  = "test.realm.com"          // Domain of KDC
 )
 
 type KDC struct {
@@ -58,7 +60,7 @@ type PrincipalDetails struct {
 
 func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 	kdc := new(KDC)
-	kdc.Realm = strings.ToUpper(srealm)
+	kdc.Realm = strings.ToUpper(ServerRealm)
 	kdc.Logger = l
 	kdc.errChan = make(chan error, 1)
 	kdc.udpClose = make(chan interface{})
@@ -76,7 +78,7 @@ func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 	}
 
 	var err error
-	kdc.TCPListener, err = net.Listen("tcp", "127.0.0.1:0")
+	kdc.TCPListener, err = net.Listen("tcp", ServerAddr)
 	if err != nil {
 		return nil, fmt.Errorf("could not create TCP listener: %v", err)
 	}
@@ -87,23 +89,23 @@ func NewKDC(principals map[string][]string, l *log.Logger) (*KDC, error) {
 
 	// Generate the krb5 config object
 	kdc.KRB5Conf = config.New()
-	encTypeID := etypeID.ETypesByName[encType]
-	kdc.KRB5Conf.LibDefaults.DefaultTGSEnctypes = []string{encType}
+	encTypeID := etypeID.ETypesByName[ServerEncType]
+	kdc.KRB5Conf.LibDefaults.DefaultTGSEnctypes = []string{ServerEncType}
 	kdc.KRB5Conf.LibDefaults.DefaultTGSEnctypeIDs = []int32{encTypeID}
-	kdc.KRB5Conf.LibDefaults.DefaultTktEnctypes = []string{encType}
+	kdc.KRB5Conf.LibDefaults.DefaultTktEnctypes = []string{ServerEncType}
 	kdc.KRB5Conf.LibDefaults.DefaultTktEnctypeIDs = []int32{encTypeID}
-	kdc.KRB5Conf.LibDefaults.PermittedEnctypes = []string{encType}
+	kdc.KRB5Conf.LibDefaults.PermittedEnctypes = []string{ServerEncType}
 	kdc.KRB5Conf.LibDefaults.PermittedEnctypeIDs = []int32{encTypeID}
 	kdc.KRB5Conf.LibDefaults.PreferredPreauthTypes = []int{int(encTypeID)}
 	kdc.KRB5Conf.LibDefaults.DefaultRealm = kdc.Realm
 	kdc.KRB5Conf.LibDefaults.DNSLookupKDC = false
 	kdc.KRB5Conf.LibDefaults.DNSLookupRealm = false
 
-	kdc.KRB5Conf.DomainRealm[strings.ToLower(srealm)] = kdc.Realm
+	kdc.KRB5Conf.DomainRealm[strings.ToLower(ServerRealm)] = kdc.Realm
 
 	kdc.KRB5Conf.Realms = append(kdc.KRB5Conf.Realms, config.Realm{
 		Realm:         kdc.Realm,
-		DefaultDomain: "test.realm.com",
+		DefaultDomain: ServerDomain,
 		KDC:           []string{kdc.TCPListener.Addr().String()},
 	})
 
