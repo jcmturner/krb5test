@@ -29,10 +29,10 @@ import (
 )
 
 var (
-	ServerEncType = "aes256-cts-hmac-sha1-96"
-	ServerAddr    = "127.0.0.1:0"
-	ServerRealm   = "TEST.REALM.COM"
-	ServerDomain  = "test.realm.com"
+	ServerEncType = "aes256-cts-hmac-sha1-96" // encrypt type supported in KDC
+	ServerAddr    = "127.0.0.1:0"             // server address of KDC
+	ServerRealm   = "TEST.REALM.COM"          // Realm of KDC
+	ServerDomain  = "test.realm.com"          // Domain of KDC
 )
 
 type KDC struct {
